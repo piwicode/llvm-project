@@ -19,6 +19,13 @@
 #include <sys/mman.h>
 #endif
 
+#if SCUDO_FUCHSIA
+#include <vector>
+#include <zircon/process.h>
+#include <zircon/syscalls.h>
+#include <zircon/syscalls/object.h>
+#endif
+
 static const char *MappingName = "scudo:test";
 
 TEST(ScudoMapTest, PageSize) {
@@ -241,3 +248,248 @@ TEST(ScudoMapTest, Zeroing) {
 
   MemMap.unmap();
 }
+
+// Verify that Fuchsia kernel resources (VMOs, open handles, and committed
+// pages) are released as expected across reservation, remap, partial/shared
+// unmap, and OOM paths.
+#if SCUDO_FUCHSIA
+namespace {
+
+struct VmoSummary {
+  size_t Count = 0;
+  size_t ViaHandleCount = 0;
+  uint64_t CommittedBytes = 0;
+};
+
+struct MapSummary {
+  size_t RwMappings = 0;
+  size_t NoAccessMappings = 0;
+  size_t Vmars = 0;
+};
+
+template <typename InfoT>
+void queryProcessInfo(zx_object_info_topic_t Topic, std::vector<InfoT> &Out) {
+  size_t Cap = 256;
+  for (;;) {
+    Out.resize(Cap);
+    size_t Actual = 0, Avail = 0;
+    ASSERT_EQ(zx_object_get_info(zx_process_self(), Topic, Out.data(),
+                                 Out.size() * sizeof(InfoT), &Actual, &Avail),
+              ZX_OK);
+    if (Actual == Avail) {
+      Out.resize(Actual);
+      return;
+    }
+    Cap = Avail + 64;
+  }
+}
+
+void summarizeVmosByName(const char *Name, VmoSummary &Out) {
+  Out = {};
+  std::vector<zx_info_vmo_t> Vmos;
+  ASSERT_NO_FATAL_FAILURE(queryProcessInfo(ZX_INFO_PROCESS_VMOS, Vmos));
+  std::vector<zx_koid_t> Seen;
+  for (const zx_info_vmo_t &V : Vmos) {
+    if (strcmp(V.name, Name) != 0)
+      continue;
+    if (V.flags & ZX_INFO_VMO_VIA_HANDLE)
+      ++Out.ViaHandleCount;
+    if (std::find(Seen.begin(), Seen.end(), V.koid) == Seen.end()) {
+      Seen.push_back(V.koid);
+      ++Out.Count;
+      Out.CommittedBytes += V.committed_bytes;
+    }
+  }
+}
+
+void summarizeVmoByKoid(zx_koid_t Koid, VmoSummary &Out) {
+  Out = {};
+  std::vector<zx_info_vmo_t> Vmos;
+  ASSERT_NO_FATAL_FAILURE(queryProcessInfo(ZX_INFO_PROCESS_VMOS, Vmos));
+  bool Found = false;
+  for (const zx_info_vmo_t &V : Vmos) {
+    if (V.koid != Koid)
+      continue;
+    if (V.flags & ZX_INFO_VMO_VIA_HANDLE)
+      ++Out.ViaHandleCount;
+    if (!Found) {
+      Found = true;
+      Out.Count = 1;
+      Out.CommittedBytes = V.committed_bytes;
+    }
+  }
+}
+
+void countMapsInRange(scudo::uptr Base, scudo::uptr Size, MapSummary &Out) {
+  Out = {};
+  std::vector<zx_info_maps_t> Maps;
+  ASSERT_NO_FATAL_FAILURE(queryProcessInfo(ZX_INFO_PROCESS_MAPS, Maps));
+  const scudo::uptr End = Base + Size;
+  for (const zx_info_maps_t &M : Maps) {
+    if (M.base < Base || M.base + M.size > End)
+      continue;
+    if (M.type == ZX_INFO_MAPS_TYPE_MAPPING) {
+      if (M.u.mapping.mmu_flags == (ZX_VM_PERM_READ | ZX_VM_PERM_WRITE))
+        ++Out.RwMappings;
+      else if (M.u.mapping.mmu_flags == 0)
+        ++Out.NoAccessMappings;
+    } else if (M.type == ZX_INFO_MAPS_TYPE_VMAR) {
+      ++Out.Vmars;
+    }
+  }
+}
+
+} // namespace
+
+TEST(ScudoMapTest, FuchsiaPrimarySingleVmoZeroHandlesAndDecommit) {
+  const scudo::uptr PageSize = scudo::getPageSizeCached();
+  constexpr scudo::uptr NumRegions = 45;
+  const scudo::uptr RegionSize = 4 * PageSize;
+  const scudo::uptr TotalSize = NumRegions * RegionSize;
+
+  scudo::ReservedMemoryT R;
+  ASSERT_TRUE(R.create(/*Addr=*/0U, TotalSize, "scudo:ut_pri"));
+  const scudo::uptr Base = R.getBase();
+  scudo::MemMapT Regions[NumRegions];
+  for (scudo::uptr I = 0; I < NumRegions; ++I)
+    Regions[I] = R.dispatch(Base + I * RegionSize, RegionSize);
+
+  VmoSummary Vmo = {};
+  MapSummary Maps = {};
+  ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_pri", Vmo));
+  EXPECT_EQ(Vmo.Count, 1U);
+  EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  EXPECT_EQ(Vmo.CommittedBytes, 0U);
+  ASSERT_NO_FATAL_FAILURE(countMapsInRange(Base, TotalSize, Maps));
+  EXPECT_EQ(Maps.RwMappings, 0U);
+  EXPECT_EQ(Maps.NoAccessMappings, 1U);
+  EXPECT_EQ(Maps.Vmars, 0U);
+
+  // Activate 10 regions (Regions[5] with MAP_PRECOMMIT so it is committed
+  // before any store), then fault in Regions[0] as well.
+  for (scudo::uptr I = 0; I < 10; ++I) {
+    const scudo::uptr Flags = (I == 5) ? MAP_PRECOMMIT : 0;
+    ASSERT_TRUE(Regions[I].remap(Regions[I].getBase() + PageSize, PageSize,
+                                 "scudo:ignored", Flags));
+  }
+  ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_pri", Vmo));
+  EXPECT_EQ(Vmo.CommittedBytes, PageSize);
+
+  const scudo::uptr Addr0 = Regions[0].getBase() + PageSize;
+  const scudo::uptr Addr5 = Regions[5].getBase() + PageSize;
+  memset(reinterpret_cast<void *>(Addr0), 0xaa, PageSize);
+  memset(reinterpret_cast<void *>(Addr5), 0xbb, PageSize);
+
+  // Zero-length release must be a no-op (ZX_VMAR_OP_DECOMMIT rejects size 0).
+  Regions[5].releaseAndZeroPagesToOS(Addr5, 0);
+  EXPECT_EQ(*reinterpret_cast<unsigned char *>(Addr5), 0xbbU);
+
+  ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_pri", Vmo));
+  EXPECT_EQ(Vmo.Count, 1U);
+  EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  EXPECT_EQ(Vmo.CommittedBytes, 2 * PageSize);
+  // ZX_INFO_PROCESS_MAPS reports each protection range inside the single
+  // VmMapping: 10 rw- active ranges separated by 11 --- guard/gap ranges.
+  ASSERT_NO_FATAL_FAILURE(countMapsInRange(Base, TotalSize, Maps));
+  EXPECT_EQ(Maps.RwMappings, 10U);
+  EXPECT_EQ(Maps.NoAccessMappings, 11U);
+  EXPECT_EQ(Maps.Vmars, 0U);
+
+  // Unmapping Regions[0] while siblings remain alive must decommit its page
+  // without disturbing Regions[5].
+  Regions[0].unmap();
+  ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_pri", Vmo));
+  EXPECT_EQ(Vmo.Count, 1U);
+  EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  EXPECT_EQ(Vmo.CommittedBytes, PageSize);
+  EXPECT_EQ(*reinterpret_cast<unsigned char *>(Addr5), 0xbbU);
+
+  for (scudo::uptr I = 1; I < NumRegions; ++I)
+    Regions[I].unmap();
+
+  ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_pri", Vmo));
+  EXPECT_EQ(Vmo.Count, 0U);
+  EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+}
+
+TEST(ScudoMapTest, FuchsiaFallbackNameStandaloneMapAndOom) {
+  const scudo::uptr PageSize = scudo::getPageSizeCached();
+  VmoSummary Vmo = {};
+
+  // ReservedMemory with Name == nullptr (used by Secondary) defaults to
+  // "scudo:secondary" and holds zero open VMO handles.
+  {
+    scudo::ReservedMemoryT R;
+    ASSERT_TRUE(R.create(/*Addr=*/0U, 3 * PageSize, nullptr));
+    const scudo::uptr Base = R.getBase();
+    std::vector<zx_info_maps_t> Maps;
+    ASSERT_NO_FATAL_FAILURE(queryProcessInfo(ZX_INFO_PROCESS_MAPS, Maps));
+    zx_koid_t Koid = ZX_KOID_INVALID;
+    for (const zx_info_maps_t &Entry : Maps) {
+      if (Entry.type == ZX_INFO_MAPS_TYPE_MAPPING && Entry.base == Base) {
+        EXPECT_STREQ(Entry.name, "scudo:secondary");
+        Koid = Entry.u.mapping.vmo_koid;
+        break;
+      }
+    }
+    ASSERT_NE(Koid, ZX_KOID_INVALID);
+    ASSERT_NO_FATAL_FAILURE(summarizeVmoByKoid(Koid, Vmo));
+    EXPECT_EQ(Vmo.Count, 1U);
+    EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+
+    scudo::MemMapT M = R.dispatch(Base, R.getCapacity());
+    ASSERT_TRUE(M.remap(Base + PageSize, 2 * PageSize, "scudo:ignored"));
+    memset(reinterpret_cast<void *>(Base + PageSize), 0x42, 2 * PageSize);
+    // Partial back-trim unmap must decommit the trimmed page immediately.
+    M.unmap(Base + 2 * PageSize, PageSize);
+    ASSERT_NO_FATAL_FAILURE(summarizeVmoByKoid(Koid, Vmo));
+    EXPECT_EQ(Vmo.CommittedBytes, PageSize);
+    M.unmap();
+    ASSERT_NO_FATAL_FAILURE(summarizeVmoByKoid(Koid, Vmo));
+    EXPECT_EQ(Vmo.Count, 0U);
+    EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  }
+
+  // Standalone map() holds zero open VMO handles while mapped.
+  {
+    scudo::MemMapT M;
+    ASSERT_TRUE(M.map(/*Addr=*/0U, 2 * PageSize, "scudo:ut_map"));
+    ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_map", Vmo));
+    EXPECT_EQ(Vmo.Count, 1U);
+    EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+    M.unmap();
+    ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_map", Vmo));
+    EXPECT_EQ(Vmo.Count, 0U);
+  }
+
+  // Unused ReservedMemory::release() resets state and destroys the VMO.
+  {
+    scudo::ReservedMemoryT R;
+    ASSERT_TRUE(R.create(/*Addr=*/0U, 2 * PageSize, "scudo:ut_rel"));
+    R.release();
+    EXPECT_FALSE(R.isCreated());
+    ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_rel", Vmo));
+    EXPECT_EQ(Vmo.Count, 0U);
+    EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  }
+
+  // MAP_ALLOWNOMEM failures leave state clean and leak zero VMOs/handles.
+  {
+    zx_info_vmar_t RootInfo = {};
+    ASSERT_EQ(zx_object_get_info(zx_vmar_root_self(), ZX_INFO_VMAR, &RootInfo,
+                                 sizeof(RootInfo), nullptr, nullptr),
+              ZX_OK);
+    scudo::ReservedMemoryT R;
+    EXPECT_FALSE(
+        R.create(/*Addr=*/0U, RootInfo.len, "scudo:ut_oom", MAP_ALLOWNOMEM));
+    EXPECT_FALSE(R.isCreated());
+    scudo::MemMapT M;
+    EXPECT_FALSE(
+        M.map(/*Addr=*/0U, RootInfo.len, "scudo:ut_oom", MAP_ALLOWNOMEM));
+    EXPECT_FALSE(M.isAllocated());
+    ASSERT_NO_FATAL_FAILURE(summarizeVmosByName("scudo:ut_oom", Vmo));
+    EXPECT_EQ(Vmo.Count, 0U);
+    EXPECT_EQ(Vmo.ViaHandleCount, 0U);
+  }
+}
+#endif // SCUDO_FUCHSIA

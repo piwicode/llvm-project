@@ -14,7 +14,6 @@
 #if SCUDO_FUCHSIA
 
 #include <stdint.h>
-#include <zircon/types.h>
 
 namespace scudo {
 
@@ -31,26 +30,25 @@ public:
     return releaseAndZeroPagesToOSImpl(From, Size);
   }
   void releaseAndZeroPagesToOSImpl(uptr From, uptr Size);
-  uptr getBaseImpl() { return WindowBase; }
-  uptr getCapacityImpl() { return WindowSize; }
+  uptr getBaseImpl() { return MapBase; }
+  uptr getCapacityImpl() { return MapCapacity; }
   s64 getResidentPagesImpl(uptr From, uptr Size);
 
 private:
   friend class ReservedMemoryFuchsia;
 
   // Used by ReservedMemoryFuchsia::dispatch.
-  MemMapFuchsia(uptr Base, uptr Capacity);
+  MemMapFuchsia(uptr Base, uptr Capacity, bool OwnsVmo);
 
-  // Virtual memory address corresponding to VMO offset 0.
-  uptr MapAddr = 0;
+  // Virtual memory base address and size of the mapping subrange still in use.
+  // unmapImpl() can shrink this range, either at the beginning or at the end.
+  uptr MapBase = 0;
+  uptr MapCapacity = 0;
 
-  // Virtual memory base address and size of the VMO subrange that is still in
-  // use. unmapImpl() can shrink this range, either at the beginning or at the
-  // end.
-  uptr WindowBase = 0;
-  uptr WindowSize = 0;
-
-  zx_handle_t Vmo = ZX_HANDLE_INVALID;
+  // True when this MemMap is the sole owner of its backing VMO (standalone
+  // mapImpl() or whole-reservation dispatch), so unmapping all of MapCapacity
+  // drops the last kernel reference without a prior decommit.
+  bool OwnsVmo = false;
 };
 
 class ReservedMemoryFuchsia final
