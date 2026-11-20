@@ -492,4 +492,22 @@ TEST(ScudoMapTest, FuchsiaFallbackNameStandaloneMapAndOom) {
     EXPECT_EQ(Vmo.ViaHandleCount, 0U);
   }
 }
+
+TEST(ScudoMapTest, FuchsiaAlignLargeReservationsTo2MiB) {
+  constexpr scudo::uptr TwoMiB = static_cast<scudo::uptr>(2) << 20;
+  for (scudo::uptr Size : {TwoMiB, 2 * TwoMiB}) {
+    scudo::ReservedMemoryT R;
+    ASSERT_TRUE(R.create(/*Addr=*/0U, Size, "scudo:ut_align"));
+#if !SCUDO_RISCV64
+    EXPECT_EQ(R.getBase() % TwoMiB, 0U);
+#endif
+    R.release();
+  }
+  // Guard-paged non-2MiB-multiple sizes (e.g. Secondary) must still succeed.
+  const scudo::uptr PageSize = scudo::getPageSizeCached();
+  scudo::ReservedMemoryT Guarded;
+  ASSERT_TRUE(
+      Guarded.create(/*Addr=*/0U, TwoMiB + 2 * PageSize, "scudo:ut_unalign"));
+  Guarded.release();
+}
 #endif // SCUDO_FUCHSIA

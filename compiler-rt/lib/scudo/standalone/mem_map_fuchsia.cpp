@@ -198,12 +198,19 @@ bool ReservedMemoryFuchsia::createImpl(UNUSED uptr Addr, uptr Size,
   // Because both the VMO and root VMAR have READ|WRITE rights, Zircon records
   // CAN_MAP_READ|CAN_MAP_WRITE on the VmMapping, letting remapImpl() toggle
   // subranges via zx_vmar_protect() while gaps stay --- and fault.
+  // Align >= 2 MiB multiples (e.g. Primary64 reservations) to 2 MiB to keep
+  // size-class regions from straddling L2 page-table boundaries; skip RISC-V 64
+  // Sv39 where 2 MiB alignment would cut ASLR entropy from 26 to 17 bits.
+  zx_vm_option_t MapFlags = 0;
+  constexpr uptr TwoMiB = static_cast<uptr>(2) << 20;
+  if (!SCUDO_RISCV64 && Size >= TwoMiB && isAligned(Size, TwoMiB))
+    MapFlags |= ZX_VM_ALIGN_2MB;
+
   // Secondary passes Name == nullptr here and "scudo:secondary" to remapImpl()
   // (which ignores Name because the VMO handle is already closed); Primary64
   // passes "scudo:primary_reserve". Default nullptr to "scudo:secondary".
-  const uptr NewBase =
-      mapNewVmo(Size, Name != nullptr ? Name : "scudo:secondary",
-                /*MapFlags=*/0, AllowNoMem);
+  const uptr NewBase = mapNewVmo(
+      Size, Name != nullptr ? Name : "scudo:secondary", MapFlags, AllowNoMem);
   if (UNLIKELY(NewBase == 0))
     return false;
 
